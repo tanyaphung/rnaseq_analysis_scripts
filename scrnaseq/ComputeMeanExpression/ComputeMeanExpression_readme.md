@@ -27,7 +27,7 @@ python explore.py -f 8110794f-d8c7-4611-8d38-67f5e22e41fb.h5ad -o explore_out.md
 ```
 
 - Examining the output `explore_out.md`: 
-    - we see that there are several brain regions (column `region`):
+    - we see that there are several brain regions (column `tissue`):
     ```
     frontal cortex
     cingulate cortex
