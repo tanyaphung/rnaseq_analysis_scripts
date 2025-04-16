@@ -1,0 +1,207 @@
+---
+title: "scRNAseq cell type annotation methods"
+author: "Tanya Phung"
+date: "2025-04-16"
+output: html_document
+---
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+```
+
+## About
+- In this document, I summarized my own experience with computational methods for cell type annotation. 
+- Last update: 2025-04-16
+
+## Test datasets
+- I used the scRNAseq dataset from Velmeshev et al. 2023 that I processed previously (see: https://github.com/tanyaphung/scrnaseq_viewer/blob/main/notes/17_Velmeshev_2023_notes.md). Because I am testing locally, I used the file that has been subsetted to second trimester for the brain region BA22 (filename: `367_Velmeshev2023_PrePostNatal_Human_2023_group1_BA22`) that contains 8152 cells in total
+
+## Step 0: Load libraries
+```{r}
+library(reticulate)
+library(anndata)
+library(Seurat)
+library(scater)
+library(SeuratDisk)
+library(SeuratData)
+library(dplyr)
+library(data.table)
+```
+
+## Step 1: Load in the scRNAseq data in h5ad format and convert to seurat format
+```{r}
+h5ad="367_Velmeshev2023_PrePostNatal_Human_2023_group1_BA22.h5ad"
+# load
+adata = read_h5ad(h5ad)
+
+#Turn into matrix and transpose
+adata_t <- t(as.matrix(adata$X))
+
+# Convert the count matrix to a Seurat object
+seurat_data <- CreateSeuratObject(counts = adata_t, project = "velmeshev", min.cells = 3, min.features = 200)
+
+# normalize data
+seurat_data[["percent.mt"]] <- PercentageFeatureSet(seurat_data, pattern = "^MT-")
+seurat_data <- NormalizeData(seurat_data, normalization.method = "LogNormalize", scale.factor = 10000)
+seurat_data <- FindVariableFeatures(seurat_data, selection.method = "vst", nfeatures = 2000)
+
+# scale and run PCA
+seurat_data <- ScaleData(seurat_data, features = rownames(seurat_data))
+seurat_data <- RunPCA(seurat_data, features = VariableFeatures(object = seurat_data))
+
+# cluster and visualize
+seurat_data <- FindNeighbors(seurat_data, dims = 1:10)
+seurat_data <- FindClusters(seurat_data, resolution = 0.8)
+seurat_data <- RunUMAP(seurat_data, dims = 1:10)
+p0 = DimPlot(seurat_data, reduction = "umap")
+```
+
+## Prepare a plot to show annotation from the original publication 
+```{r}
+adata$obs$sampleID = row.names(adata$obs)
+adata_new = adata$obs
+adata_new_subset = adata_new %>% select("sampleID", "cell_type_level_1")
+colnames(adata_new_subset) = c("sampleID", "original")
+
+seurat_data@meta.data$sampleID = row.names(seurat_data@meta.data)
+
+seurat_data@meta.data = merge(seurat_data@meta.data, adata_new_subset, by = "sampleID")
+
+rownames(seurat_data@meta.data) = seurat_data@meta.data$sampleID
+
+
+p1 = DimPlot(seurat_data, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'original') + NoLegend()
+```
+
+## scRNAseq annotation method 1: scType
+- https://sctype.app/sctype_docs/index.html
+- https://www.nature.com/articles/s41467-022-28803-w
+- utilizes scType database: database of established cell-specific markers
+- Here I will use the marker genes from the database provided by scType and the marker genes for developing brain curated from a previous intern project (link: https://github.com/vu-ctg/transcriptome_comp/blob/main/code/sctype_annotation/gs_listv4.xlsx)
+
+```{r}
+lapply(c("dplyr","Seurat","HGNChelper","openxlsx"), library, character.only = T)
+source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/gene_sets_prepare.R"); source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/sctype_score_.R")
+```
+
+### Using scType's database
+
+```{r}
+tissue="Brain"
+gs_list <- gene_sets_prepare("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/ScTypeDB_full.xlsx", "Brain")
+
+# get cell-type by cell matrix
+es.max = sctype_score(scRNAseqData = seurat_data[["RNA"]]$scale.data, scaled = TRUE, gs = gs_list$gs_positive, gs2 = gs_list$gs_negative)
+
+# merge by cluster
+cL_resutls = do.call("rbind", lapply(unique(seurat_data@meta.data$seurat_clusters), function(cl){
+  es.max.cl = sort(rowSums(es.max[ ,rownames(seurat_data@meta.data[seurat_data@meta.data$seurat_clusters==cl, ])]), decreasing = !0)
+  head(data.frame(cluster = cl, type = names(es.max.cl), scores = es.max.cl, ncells = sum(seurat_data@meta.data$seurat_clusters==cl)), 10)
+}))
+sctype_scores = cL_resutls %>% group_by(cluster) %>% top_n(n = 1, wt = scores)  
+
+# set low-confident (low ScType score) clusters to "unknown"
+sctype_scores$type[as.numeric(as.character(sctype_scores$scores)) < sctype_scores$ncells/4] = "Unknown"
+print(sctype_scores[,1:3])
+
+seurat_data@meta.data$scTypeDefault = ""
+for(j in unique(sctype_scores$cluster)){
+  cl_type = sctype_scores[sctype_scores$cluster==j,]; 
+  seurat_data@meta.data$scTypeDefault[seurat_data@meta.data$seurat_clusters == j] = as.character(cl_type$type[1])
+}
+
+p2 = DimPlot(seurat_data, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'scTypeDefault') + NoLegend()
+```
+
+```{r}
+gs_list <- gene_sets_prepare("gs_listv4.xlsx", "Brain")
+
+# get cell-type by cell matrix
+es.max = sctype_score(scRNAseqData = seurat_data[["RNA"]]$scale.data, scaled = TRUE, gs = gs_list$gs_positive, gs2 = gs_list$gs_negative)
+
+# merge by cluster
+cL_resutls = do.call("rbind", lapply(unique(seurat_data@meta.data$seurat_clusters), function(cl){
+  es.max.cl = sort(rowSums(es.max[ ,rownames(seurat_data@meta.data[seurat_data@meta.data$seurat_clusters==cl, ])]), decreasing = !0)
+  head(data.frame(cluster = cl, type = names(es.max.cl), scores = es.max.cl, ncells = sum(seurat_data@meta.data$seurat_clusters==cl)), 10)
+}))
+sctype_scores = cL_resutls %>% group_by(cluster) %>% top_n(n = 1, wt = scores)  
+
+# set low-confident (low ScType score) clusters to "unknown"
+sctype_scores$type[as.numeric(as.character(sctype_scores$scores)) < sctype_scores$ncells/4] = "Unknown"
+print(sctype_scores[,1:3])
+
+seurat_data@meta.data$scTypeCurated = ""
+for(j in unique(sctype_scores$cluster)){
+  cl_type = sctype_scores[sctype_scores$cluster==j,]; 
+  seurat_data@meta.data$scTypeCurated[seurat_data@meta.data$seurat_clusters == j] = as.character(cl_type$type[1])
+}
+
+p3 = DimPlot(seurat_data, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'scTypeCurated') + NoLegend()
+```
+
+## scRNAseq annotation method 2: celltypist
+- https://www.celltypist.org/
+- Followed the readme here: https://github.com/Teichlab/celltypist
+- Make sure that for h5ad file, a log-normalised expression matrix (to 10,000 counts per cell) is expected (raw-count adata processed by scanpy.pp.normalize_total(target_sum=1e4) and scanpy.pp.log1p) (source: https://www.celltypist.org/tutorials/onlineguide)
+- Python command: 
+```
+import celltypist
+from celltypist import models
+models.download_models()
+predictions = celltypist.annotate('367_Velmeshev2023_PrePostNatal_Human_2023_group1_BA22_forCelltypist.h5ad', model = 'Adult_Human_MTG.pkl')
+predictions.predicted_labels.reset_index(inplace=True)
+predictions.predicted_labels.to_csv("celltypist_pred_v2_MTG.csv", index=False)
+```
+- Generate a plot
+```{r}
+celltypist = fread("celltypist_pred_v2_MTG.csv")
+celltypist_subset = celltypist %>% select("index", "predicted_labels")
+colnames(celltypist_subset) = c("sampleID", "celltypist")
+
+seurat_data@meta.data = merge(seurat_data@meta.data, celltypist_subset, by = "sampleID")
+
+rownames(seurat_data@meta.data) = seurat_data@meta.data$sampleID
+
+
+p4 = DimPlot(seurat_data, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'celltypist') + NoLegend()
+```
+
+## scRNAseq annotation method 2: Azimuth
+- https://azimuth.hubmapconsortium.org/
+- Currently I can only use Azimuth via the Rshiny application. I tried to download the software (https://satijalab.github.io/azimuth/articles/run_azimuth_tutorial.html) but so far it has failed to install on my R version. 
+- Generate a plot after download the results
+```{r}
+azimuth = fread("azimuth_pred.tsv")
+azimuth_subset = azimuth %>% select("cell", "predicted.subclass")
+colnames(azimuth_subset) = c("sampleID", "azimuth")
+
+seurat_data@meta.data = merge(seurat_data@meta.data, azimuth_subset, by = "sampleID")
+
+rownames(seurat_data@meta.data) = seurat_data@meta.data$sampleID
+
+
+p5 = DimPlot(seurat_data, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'azimuth') + NoLegend()
+```
+
+## Plotting
+```
+library(ggpubr)
+ggarrange(p0, p1, p2, p3, p4, p5, ncol = 2, nrow = 3)
+```
+
+!(celltype_annotation_comparison.jpeg "Cell type annotation methods comparison")
+
+## My take
+- Cell type annotation of OPCs and Astrocytes seem to be very consistent across methods
+- scType seems to not be able to pick out Microglia and instead annotated as endothelial cells 
+- In general, the same clusters of cells are annotated as inhibitory neurons or excitatory neurons across different methods. However, the details on the specific types of excitatory neurons or inhibitory neurons are questionable. 
+
+## Summary 
+Method | Computational time (not exact) | Advantages | Disadvantages | Other notes
+--- | --- | --- | ---
+scType | relatively fast | easy/fast to install/run | requires a high quality marker genes and may require expert input | run in R
+CellTypist | relatively fast | easy/fast to install/run | requires a reference | run in python
+Azimuth | NA because I am unable to run it locally | NA | requires a reference | local implementation in R is not working yet
+
+
+
