@@ -156,7 +156,7 @@ def main():
     adata_subset.var.reset_index(inplace=True) #since row index of adata.var is ensemble_id, we want to convert this into a column
     adata_subset.var = adata_subset.var.rename(columns={'feature_name': 'symbol'}) #update the column names to have consistent naming convention
     # convert to ensembl from symbol
-    gene_names_fp = '/gpfs/work5/0/vusr0480/Preprocessing_scRNA/code/conversion_files/gene_names_human.txt' #path to gene_names_human.txt
+    gene_names_fp = 'gene_names_human.txt' #path to gene_names_human.txt
     gene_names_add = "Ensembl gene ID"
     adata_gene_converted = single_cell_helper_functions_v3.add_gene_names_human(adata_subset, gene_names_fp, gene_names_org, gene_names_add)
     ngenes_after_conversion = adata_gene_converted.var.dropna(subset=["ensembl"]).shape[0]
